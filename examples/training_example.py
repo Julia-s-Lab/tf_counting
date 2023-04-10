@@ -8,20 +8,12 @@ from causal_transformer_decoder import (
     CausalTransformerDecoderLayer,
 )
 
+import numpy as np
+import fire, itertools, os
+from matplotlib import pyplot as plt
 
-# The task here is a seq2seq task which consists in doubling every char
-# Example: input "abcd", output "aabbccdd"
-
-CHARS = "qwertyuiopasdfghjklzxcvbnm"
+CHARS = "bac"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 128
-MAX_NUM_STEP = 10000
-INTERVAL_TEST = 100
-
-USE_OPTIMIZED_DECODER = True
-# True -> use CausalTransformerDecoder
-# False -> use regular TransformerDecoder
-
 
 class CharVocab:
     def __init__(self):
@@ -31,6 +23,7 @@ class CharVocab:
         self.idx_start_token = 1
         self.idx_end_token = 2
         self.idx_to_char += [char for char in CHARS]
+        self.idx_to_char += [str(i) for i in range(config['N'])]
         self.char_to_idx = {
             self.idx_to_char[k]: k for k in range(len(self.idx_to_char))
         }
@@ -54,17 +47,24 @@ def create_random_sent(max_length=20):
     sent = "".join([CHARS[randint(0, len(CHARS) - 1)] for _ in range(length)])
     return sent
 
+def hypothesis(count):
+    value = 0
+    for k, v in count.items():
+        value += config['coeffs'][k]*(v**config['powers'][k])
+    return (value % config['N'])
 
 def generate_xy():
     """ create input/label pair """
     sent_input = create_random_sent()
-    label = "".join([f"{char}{char}" for char in sent_input])
+    count, label = dict(zip(CHARS, [0 for i in range(len(CHARS))])), ""
+    for char in sent_input:
+        count[char] += 1
+        label += str(hypothesis(count))
     return sent_input, label
-
 
 def batch_generator(vocab):
     while True:
-        x, y = list(zip(*[generate_xy() for _ in range(BATCH_SIZE)]))
+        x, y = list(zip(*[generate_xy() for _ in range(config['batch_size'])]))
         x_idx = vocab.sents_to_idx(x)
         y_idx = vocab.sents_to_idx(y)
 
@@ -116,9 +116,9 @@ class Model(nn.Module):
         super(Model, self).__init__()
 
         hdim = 256
-        nhead = 4
+        nhead = config['num_heads']
         dim_feedforward = hdim * 4
-        num_layers = 2
+        num_layers = config['num_layers']
         self.vocab = vocab
         vocab_size = len(vocab)
 
@@ -132,7 +132,7 @@ class Model(nn.Module):
             num_layers=num_layers,
         ).to(device=DEVICE)
 
-        if USE_OPTIMIZED_DECODER:
+        if config['optimized_decoder']:
             self.decoder = CausalTransformerDecoder(
                 CausalTransformerDecoderLayer(
                     d_model=hdim, nhead=nhead, dim_feedforward=dim_feedforward,
@@ -176,7 +176,7 @@ class Model(nn.Module):
             input_embed, src_key_padding_mask=memory_mask
         )  # input_len, bsz, hdim
 
-        if USE_OPTIMIZED_DECODER:
+        if config['optimized_decoder']:
             decoded = self.decoder(
                 teach_forcing_embed,
                 memory=encoded,
@@ -223,7 +223,7 @@ class Model(nn.Module):
 
             decoded_embedding = self.positional_encoding(self.embedding(decoded_tokens))
 
-            if USE_OPTIMIZED_DECODER:
+            if config['optimized_decoder']:
                 decoded, cache = self.decoder(
                     decoded_embedding,
                     encoded,
@@ -257,38 +257,108 @@ class Model(nn.Module):
         return self.vocab.idx_to_sent(output_tokens)
 
 
-vocab = CharVocab()
-model = Model(vocab).to(DEVICE)
-optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
-criterion = nn.CrossEntropyLoss()
-pbar = tqdm(enumerate(batch_generator(vocab)))
+def run_experiment():
 
+    vocab = CharVocab()
+    model = Model(vocab).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+    criterion = nn.CrossEntropyLoss()
+    pbar = tqdm(enumerate(batch_generator(vocab)))
 
-for num_step, data in pbar:
-    model.train()
-    inputs, labels = data
+    task_coeffs = ''.join(map(str, list(config['coeffs'].values())))
+    task_powers = ''.join(map(str, list(config['powers'].values())))
+    path = f'./results/{config["N"]}/powers_{task_powers}/coeffs_{task_coeffs}/{config["num_layers"]}/{config["num_heads"]}/{config["lr"]}/{config["batch_size"]}'
+    os.makedirs(path, exist_ok=True)
+    os.makedirs(path+'/results', exist_ok=True)
 
-    teach_forcing_tokens = labels.clone()
-    teach_forcing_tokens = torch.cat(
-        [torch.ones_like(teach_forcing_tokens[:, :1]), teach_forcing_tokens], dim=1
-    )  # adding start token
+    _loss = []
+    for num_step, data in pbar:
+        model.train()
+        inputs, labels = data
 
-    # zero the parameter gradients
-    optimizer.zero_grad()
+        teach_forcing_tokens = labels.clone()
+        teach_forcing_tokens = torch.cat(
+            [torch.ones_like(teach_forcing_tokens[:, :1]), teach_forcing_tokens], dim=1
+        )  # adding start token
 
-    # forward + backward + optimize
-    outputs = model(inputs, teach_forcing_tokens)
-    loss = criterion(outputs[:, :-1, :].permute(0, 2, 1), labels)
-    loss.backward()
-    optimizer.step()
+        # zero the parameter gradients
+        optimizer.zero_grad()
 
-    pbar.set_postfix({"loss": loss})  # display loss in progress bar
+        # forward + backward + optimize
+        outputs = model(inputs, teach_forcing_tokens)
+        loss = criterion(outputs[:, :-1, :].permute(0, 2, 1), labels)
+        loss.backward()
+        optimizer.step()
 
-    if num_step == MAX_NUM_STEP:
-        break
+        pbar.set_postfix({"loss": loss})  # display loss in progress bar
 
-    if num_step % INTERVAL_TEST == 0:  # try inference to check that it works well
-        test_sent = create_random_sent()
-        model.eval()
-        with torch.no_grad():
-            print(f"Input {test_sent}, output: {model.predict(test_sent)}")
+        _loss.append(loss.item())
+
+        if num_step == config['max_steps']:
+            break
+
+        if num_step % config['interval_test'] == 0:  # try inference to check that it works well & save checkpoint
+            torch.save({
+            'step': num_step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss.item(),
+            }, path+f'/results/model{num_step}.pt')
+
+            test_sent = create_random_sent()
+            model.eval()
+            with torch.no_grad():
+                print(f"Input {test_sent}, output: {model.predict(test_sent)}")
+        
+    np.save(path+f'/results/loss.npy', _loss)
+    plt.title(f"Train Loss")
+    plt.plot(_loss, lw=2)
+    plt.grid()
+    plt.savefig(path+'/results/loss.pdf')
+    plt.show()
+    plt.close()
+
+def retrieve_config(sweep_step):
+    grid = {
+        'coeffs': [dict(zip(CHARS, [1 for i in range(len(CHARS))])), dict(zip(CHARS, [2 for i in range(len(CHARS))])), dict(zip(CHARS, [i for i in range(len(CHARS))]))],
+        'powers': [dict(zip(CHARS, [1 for i in range(len(CHARS))])), dict(zip(CHARS, [2 for i in range(len(CHARS))])), dict(zip(CHARS, [i for i in range(len(CHARS))]))],
+        'N': [3],
+        'lr': [5e-5],
+        'batch_size': [128],
+        'max_steps': [10000],
+        'interval_test': [100],
+        'num_layers': [2],
+        'num_heads': [4],
+        'optimized_decoder': [True]
+    }
+
+    grid_setups = list(
+        dict(zip(grid.keys(), values)) for values in itertools.product(*grid.values())
+    )
+    step_grid = grid_setups[sweep_step - 1]  # slurm var will start from 1
+
+    config = {
+        'sweep_step': sweep_step,
+        'coeffs': step_grid['coeffs'],
+        'powers': step_grid['powers'],
+        'N': step_grid['N'],
+        'lr': step_grid['lr'],
+        'batch_size': step_grid['batch_size'],
+        'max_steps': step_grid['max_steps'],
+        'interval_test': step_grid['interval_test'],
+        'num_layers': step_grid['num_layers'],
+        'num_heads': step_grid['num_heads'],
+        'optimized_decoder': step_grid['optimized_decoder']
+    }
+
+    return config
+
+def main(sweep_step):
+    global config
+    config = retrieve_config(sweep_step)
+    print(config)
+    print('---------.--------')
+    run_experiment()
+
+if __name__ == '__main__':
+    fire.Fire(main)
