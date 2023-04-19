@@ -11,9 +11,25 @@ from causal_transformer_decoder import (
 import numpy as np
 import fire, itertools, os
 from matplotlib import pyplot as plt
+from torch.utils.data.dataset import Dataset
 
 CHARS = "bac"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TRAIN_SIZE = 50000
+TEST_SIZE = 100
+
+class MyDataset(Dataset):
+    def __init__(self, x, y):
+        super(MyDataset, self).__init__()
+        assert x.shape[0] == y.shape[0]
+        self.x = x
+        self.y = y
+
+    def __len__(self):
+        return self.y.shape[0]
+
+    def __getitem__(self, index):
+        return self.x[index], self.y[index]
 
 class CharVocab:
     def __init__(self):
@@ -41,9 +57,9 @@ class CharVocab:
         return "".join([self.idx_to_char[idx] for idx in idx_list])
 
 
-def create_random_sent(max_length=20):
+def create_random_sent(max_length=20, min_length=1):
     """ Create random sequence containing 1 to {max_length} characters """
-    length = randint(1, max_length)
+    length = randint(min_length, max_length)
     sent = "".join([CHARS[randint(0, len(CHARS) - 1)] for _ in range(length)])
     return sent
 
@@ -53,9 +69,9 @@ def hypothesis(count):
         value += config['coeffs'][k]*(v**config['powers'][k])
     return (value % config['N'])
 
-def generate_xy():
+def generate_xy(max_length=20, min_length=1):
     """ create input/label pair """
-    sent_input = create_random_sent()
+    sent_input = create_random_sent(max_length, min_length)
     count, label = dict(zip(CHARS, [0 for i in range(len(CHARS))])), ""
     for char in sent_input:
         count[char] += 1
@@ -77,6 +93,19 @@ def batch_generator(vocab):
         y_padded = nn.utils.rnn.pad_sequence(y_idx, batch_first=True)
         yield x_padded, y_padded
 
+def dataset_generator(vocab, size):
+    x, y = list(zip(*[generate_xy() for _ in range(size)]))
+    x_idx = vocab.sents_to_idx(x)
+    y_idx = vocab.sents_to_idx(y)
+
+    # add end token as it is used for training loss
+    y_idx = [elt + [vocab.idx_end_token] for elt in y_idx]
+
+    x_idx = [torch.LongTensor(elt).to(DEVICE) for elt in x_idx]
+    y_idx = [torch.LongTensor(elt).to(DEVICE) for elt in y_idx]
+    x_padded = nn.utils.rnn.pad_sequence(x_idx, batch_first=True)
+    y_padded = nn.utils.rnn.pad_sequence(y_idx, batch_first=True)
+    return x_padded, y_padded
 
 class PositionalEncoding(nn.Module):
     """ Code from https://pytorch.org/tutorials/beginner/transformer_tutorial.html """
@@ -263,58 +292,109 @@ def run_experiment():
     model = Model(vocab).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
     criterion = nn.CrossEntropyLoss()
-    pbar = tqdm(enumerate(batch_generator(vocab)))
+    # pbar = tqdm(enumerate(batch_generator(vocab)))
+
+    # Data generation
+    x_train, y_train = dataset_generator(vocab, size=TRAIN_SIZE)
+    train_dataset = MyDataset(x_train, y_train)
+    trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+
+    x_test, y_test = list(zip(*[generate_xy() for _ in range(TEST_SIZE)]))
+    x_test_longer, y_test_longer = list(zip(*[generate_xy(max_length=30, min_length=20) for _ in range(TEST_SIZE)]))
 
     task_coeffs = ''.join(map(str, list(config['coeffs'].values())))
     task_powers = ''.join(map(str, list(config['powers'].values())))
-    path = f'./results/{config["N"]}/powers_{task_powers}/coeffs_{task_coeffs}/{config["num_layers"]}/{config["num_heads"]}/{config["lr"]}/{config["batch_size"]}'
+    path = f'./results/multipass/{config["N"]}/powers_{task_powers}/coeffs_{task_coeffs}/{config["num_layers"]}/{config["num_heads"]}/{config["lr"]}/{config["batch_size"]}'
     os.makedirs(path, exist_ok=True)
     os.makedirs(path+'/results', exist_ok=True)
 
-    _loss = []
-    for num_step, data in pbar:
-        model.train()
-        inputs, labels = data
+    _loss, _test_acc, _test_acc_longer, pbar = [], [], [], tqdm(range(config['max_epochs']))
+    for epoch in pbar:
+        cur_loss, count = 0, 0
+        for inputs, labels in trainloader:
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            # for num_step, data in pbar:
+            model.train()
+            # inputs, labels = data
 
-        teach_forcing_tokens = labels.clone()
-        teach_forcing_tokens = torch.cat(
-            [torch.ones_like(teach_forcing_tokens[:, :1]), teach_forcing_tokens], dim=1
-        )  # adding start token
+            teach_forcing_tokens = labels.clone()
+            teach_forcing_tokens = torch.cat(
+                [torch.ones_like(teach_forcing_tokens[:, :1]), teach_forcing_tokens], dim=1
+            )  # adding start token
 
-        # zero the parameter gradients
-        optimizer.zero_grad()
+            # zero the parameter gradients
+            optimizer.zero_grad()
 
-        # forward + backward + optimize
-        outputs = model(inputs, teach_forcing_tokens)
-        loss = criterion(outputs[:, :-1, :].permute(0, 2, 1), labels)
-        loss.backward()
-        optimizer.step()
+            # forward + backward + optimize
+            outputs = model(inputs, teach_forcing_tokens)
+            loss = criterion(outputs[:, :-1, :].permute(0, 2, 1), labels)
+            loss.backward()
+            optimizer.step()
 
-        pbar.set_postfix({"loss": loss})  # display loss in progress bar
+            cur_loss += loss.item() * inputs.shape[0]
+            count += inputs.shape[0]
+        
+        # _loss.append(loss.item())
+        pbar.set_postfix({"loss": cur_loss / count})  # display loss in progress bar
+        _loss.append(cur_loss / count)
 
-        _loss.append(loss.item())
+            # if num_step == config['max_steps']:
+            #     break
 
-        if num_step == config['max_steps']:
-            break
+        if epoch % config['interval_test'] == 0:  # try inference to check that it works well & save checkpoint
 
-        if num_step % config['interval_test'] == 0:  # try inference to check that it works well & save checkpoint
-            torch.save({
-            'step': num_step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss.item(),
-            }, path+f'/results/model{num_step}.pt')
-
-            test_sent = create_random_sent()
+            # test_sent = create_random_sent()
             model.eval()
             with torch.no_grad():
-                print(f"Input {test_sent}, output: {model.predict(test_sent)}")
+                test_acc = 0
+                for inputs, labels in zip(x_test, y_test):
+                    pred = model.predict(inputs)
+                    print(f"Input {inputs}, prediction: {pred}, expected output: {labels}")
+                    test_acc += (pred == labels) # zero-one loss on string level
+                
+                _test_acc.append(test_acc / TEST_SIZE)
+
+                print('-- Length extrapolation --')
+
+                test_acc = 0
+                for inputs, labels in zip(x_test_longer, y_test_longer):
+                    pred = model.predict(inputs)
+                    print(f"Input {inputs}, prediction: {pred}, expected output: {labels}")
+                    test_acc += (pred == labels) # zero-one loss on string level
+
+                _test_acc_longer.append(test_acc / TEST_SIZE)
+            torch.save({
+            'step': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': _loss[-1],
+            'test_acc': _test_acc[-1],
+            'test_acc_longer': _test_acc_longer[-1],
+            }, path+f'/results/model{epoch}.pt')
+
+
         
     np.save(path+f'/results/loss.npy', _loss)
     plt.title(f"Train Loss")
     plt.plot(_loss, lw=2)
     plt.grid()
     plt.savefig(path+'/results/loss.pdf')
+    plt.show()
+    plt.close()
+
+    np.save(path+f'/results/test_acc.npy', _test_acc)
+    plt.title(f"Test Accuracy")
+    plt.plot(_test_acc, lw=2)
+    plt.grid()
+    plt.savefig(path+'/results/test_acc.pdf')
+    plt.show()
+    plt.close()
+
+    np.save(path+f'/results/test_acc_longer.npy', _test_acc_longer)
+    plt.title(f"Length Extrapolation Accuracy")
+    plt.plot(_test_acc_longer, lw=2)
+    plt.grid()
+    plt.savefig(path+'/results/test_acc_longer.pdf')
     plt.show()
     plt.close()
 
@@ -325,10 +405,10 @@ def retrieve_config(sweep_step):
         'N': [3],
         'lr': [5e-5],
         'batch_size': [128],
-        'max_steps': [10000],
-        'interval_test': [100],
-        'num_layers': [2],
-        'num_heads': [4],
+        'max_epochs': [50],
+        'interval_test': [1],
+        'num_layers': [1, 2],
+        'num_heads': [1, 4],
         'optimized_decoder': [True]
     }
 
@@ -344,7 +424,7 @@ def retrieve_config(sweep_step):
         'N': step_grid['N'],
         'lr': step_grid['lr'],
         'batch_size': step_grid['batch_size'],
-        'max_steps': step_grid['max_steps'],
+        'max_epochs': step_grid['max_epochs'],
         'interval_test': step_grid['interval_test'],
         'num_layers': step_grid['num_layers'],
         'num_heads': step_grid['num_heads'],
